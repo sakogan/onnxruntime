@@ -18,6 +18,20 @@ Abstract:
 
 #include "mlasi.h"
 
+//
+// Define the parameters to execute segments of a NCHW output reordering
+// operation on worker threads.
+//
+
+struct MLAS_REORDER_OUTPUT_NCHW_BLOCK {
+    ptrdiff_t TargetThreadCount;
+    const float* S;
+    float* D;
+    size_t OutputChannels;
+    size_t OutputSize;
+    size_t TasksCount;
+};
+
 MLAS_FORCEINLINE
 void
 MlasReorderGatherFloat32x4(
@@ -397,26 +411,22 @@ Return Value:
 }
 
 void
-MLASCALL
-MlasReorderOutputNchw(
-    const int64_t* OutputShape,
-    const float* S,
-    float* D,
-    MLAS_THREADPOOL* p
+MlasReorderOutputNchwThreaded(
+    void* Context,
+    ptrdiff_t Index
     )
 /*++
 
 Routine Description:
 
-    This routine reorders an output buffer from NCHWc to NCHW format.
+    This routine is invoked from a worker thread to execute a segment of a
+    NCHW output reordering operation.
 
 Arguments:
 
-    OutputShape - Supplies the shape of the output tensor.
+    Context - Supplies the pointer to the context for the threaded operation.
 
-    S - Supplies the address of the source tensor.
-
-    D - Supplies the address of the destination tensor.
+    Index - Supplies the current index of the threaded operation.
 
 Return Value:
 
@@ -424,34 +434,47 @@ Return Value:
 
 --*/
 {
+    const auto* WorkBlock = (MLAS_REORDER_OUTPUT_NCHW_BLOCK*)Context;
+
+    const size_t OutputChannels = WorkBlock->OutputChannels;
+    const size_t OutputSize = WorkBlock->OutputSize;
+    const float* S = WorkBlock->S;
+    float* D =  WorkBlock->D;
+
     const size_t BlockSize = MlasNchwcGetBlockSize();
-
-    const size_t BatchCount = size_t(OutputShape[0]);
-    const size_t OutputChannels = size_t(OutputShape[1]);
-    const size_t OutputSize = size_t(OutputShape[2]) * size_t(OutputShape[3]);
-
-    const size_t NumTasksPerBatch = ceil(((float)OutputChannels) / BlockSize);
-    const size_t NumTasksTotal = BatchCount * NumTasksPerBatch;
-    const size_t LastNumTaskInBatch = NumTasksPerBatch - 1;
+    const size_t TasksPerBatch = size_t(ceil(((float)OutputChannels) / BlockSize));
+    const size_t LastTaskInBatch = TasksPerBatch - 1;
 
     //
-    // Transpose NCHWc blocks from the source buffer to the destination buffer.
+    // Compute the range of task indices to use for this thread.
     //
 
-    MLAS_THREADPOOL::TryBatchParallelFor(p, static_cast<int32_t>(NumTasksTotal), 
-        [&](ptrdiff_t TaskID) {
+    size_t TaskStart;
+    size_t TasksRemaining;
 
-        size_t NumBatch = TaskID / NumTasksPerBatch;
-        size_t NumTaskInBatch = TaskID % NumTasksPerBatch;
+    MlasPartitionWork(Index, WorkBlock->TargetThreadCount, WorkBlock->TasksCount,
+        &TaskStart, &TasksRemaining);
 
-        const size_t OutputChannelsThisIteration = (NumTaskInBatch > 0) ? 
-            BlockSize : OutputChannels - BlockSize * LastNumTaskInBatch;
+    size_t TaskEnd = TaskStart + TasksRemaining;
+
+    //
+    // Transpose NCHWc blocks associated with tasks in the range [TaskStart, TaskEnd) 
+    // from the source buffer to the destination buffer.
+    //
+
+    for (size_t t = TaskStart; t < TaskEnd; t++) {
+
+        size_t Batch = t / TasksPerBatch;
+        size_t TaskInBatch = t % TasksPerBatch;
+
+        const size_t OutputChannelsThisIteration = (TaskInBatch > 0) ? 
+            BlockSize : OutputChannels - BlockSize * LastTaskInBatch;
         const size_t AlignedOutputChannelsThisIteration = OutputChannelsThisIteration & (~3);
 
-        const float* s = S + BlockSize * OutputSize * 
-            (NumBatch *  NumTasksPerBatch + LastNumTaskInBatch - NumTaskInBatch);
-        float* d = D + OutputSize * 
-            (NumBatch * OutputChannels + BlockSize * (LastNumTaskInBatch - NumTaskInBatch));
+        const float* s = S + BlockSize * OutputSize *
+            (Batch * TasksPerBatch + LastTaskInBatch - TaskInBatch);
+        float* d = D + OutputSize *
+            (Batch * OutputChannels + BlockSize * (LastTaskInBatch - TaskInBatch));
         size_t OutputSizeRemaining = OutputSize;
 
         for (; OutputSizeRemaining >= 4; OutputSizeRemaining -= 4) {
@@ -495,9 +518,71 @@ Return Value:
 
             s += BlockSize;
             d += 1;
-        }
-            
-    }, 0);
+        }            
+    }
+}
+
+
+void
+MLASCALL
+MlasReorderOutputNchw(
+    const int64_t* OutputShape,
+    const float* S,
+    float* D,
+    MLAS_THREADPOOL* ThreadPool
+    )
+/*++
+
+Routine Description:
+
+    This routine reorders an output buffer from NCHWc to NCHW format.
+
+Arguments:
+
+    OutputShape - Supplies the shape of the output tensor.
+
+    S - Supplies the address of the source tensor.
+
+    D - Supplies the address of the destination tensor.
+
+Return Value:
+
+    None.
+
+--*/
+{
+    MLAS_REORDER_OUTPUT_NCHW_BLOCK WorkBlock;
+
+    //
+    // Capture the NCHW reorder output operation parameters to the work block.
+    //
+
+    WorkBlock.S = S;
+    WorkBlock.D = D;
+    
+    WorkBlock.OutputChannels = size_t(OutputShape[1]);
+    WorkBlock.OutputSize = size_t(OutputShape[2]) * size_t(OutputShape[3]);
+  
+    //
+    // Schedule the operation across a set of worker threads. Limit the number 
+    // of threads to at least the number of available tasks.
+    //
+
+    ptrdiff_t TargetThreadCount = MlasGetMaximumThreadCount(ThreadPool);
+
+    const size_t BlockSize = MlasNchwcGetBlockSize();
+    const size_t TasksPerBatch = size_t(ceil(((float)WorkBlock.OutputChannels) / BlockSize));
+    const size_t BatchCount = size_t(OutputShape[0]);
+    const size_t TasksCount = BatchCount * TasksPerBatch;
+
+    if (size_t(TargetThreadCount) > TasksCount) {
+        TargetThreadCount = ptrdiff_t(TasksCount);
+    }
+
+    WorkBlock.TasksCount = TasksCount;
+    WorkBlock.TargetThreadCount = TargetThreadCount;
+
+    MlasExecuteThreaded(MlasReorderOutputNchwThreaded, &WorkBlock, TargetThreadCount, ThreadPool);
 }
 
 void
