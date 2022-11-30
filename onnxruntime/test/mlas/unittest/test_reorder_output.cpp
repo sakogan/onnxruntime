@@ -3,6 +3,9 @@
 
 #include "test_util.h"
 
+#include <iostream>
+using namespace std::chrono;
+
 class MlasReorderOutputTest : public MlasTestBase {
  private:
   const size_t BlockSize = MlasNchwcGetBlockSize();
@@ -27,7 +30,12 @@ class MlasReorderOutputTest : public MlasTestBase {
     std::fill_n(Output, OutputBufferElements, -0.5f);
     std::fill_n(OutputReference, OutputBufferElements, -0.5f);
 
+    auto time_start = high_resolution_clock::now();
     MlasReorderOutputNchw(NchwOutputShape, Input, Output, GetMlasThreadPool());
+    auto time_end = high_resolution_clock::now();
+    auto t = duration_cast<microseconds>(time_end - time_start).count();
+    std::cout << BatchCount << ":" << Channels << ":" << Height << ":" << Width << "--" << (int64_t)t << "us" << std::endl;
+
     ReferenceReorderOutput(BatchCount, Channels, Height, Width, Input, OutputReference, false);
     ASSERT_EQ(memcmp(Output, OutputReference, OutputBufferElements * sizeof(float)), 0)
         << " [Nchw] batch=" << BatchCount << ", channels=" << Channels
@@ -80,10 +88,20 @@ class MlasReorderOutputTest : public MlasTestBase {
   }
 
   void ExecuteShort(void) override {
-    for (size_t c = 1; c < 48; c++) {
-      Test(1, c, 112, 112);
-      Test(4, c, 15, 21);
-      Test(16, c, 11, 11);
+    // for (size_t c = 1; c < 48; c++) {
+    //   Test(1, c, 112, 112);
+    //   Test(4, c, 15, 21);
+    //   Test(16, c, 11, 11);
+    // }
+
+    for (int i = 0; i < 100; i++) {
+      Test(1, 1, 112, 112);
+      Test(1, 64, 320, 168);
+      Test(1, 128, 160, 84);
+      Test(13, 96, 4, 314);
+      Test(13, 240, 4, 314);
+      Test(30, 336, 4, 140);
+      Test(30, 240, 4, 140);
     }
   }
 };
